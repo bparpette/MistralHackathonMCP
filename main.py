@@ -1,6 +1,12 @@
 """
 MCP Collective Brain Server - Version multi-tenant optimisée pour Lambda
 Système de mémoire collective avec isolation par équipe
+
+Configuration Lambda:
+- Timeouts courts (2s) pour éviter les cold starts
+- Logs minimaux en production Lambda
+- Activation paresseuse de Qdrant
+- Limite de résultats réduite (20 au lieu de 1000)
 """
 
 import os
@@ -54,15 +60,24 @@ Distance = None
 VectorParams = None
 PointStruct = None
 
-# Charger les variables d'environnement depuis config.env.example si .env n'existe pas
-if not os.path.exists('.env') and os.path.exists('config.env.example'):
-    with open('config.env.example', 'r') as f:
-        for line in f:
-            line = line.strip()
-            if line and not line.startswith('#') and '=' in line:
-                key, value = line.split('=', 1)
-                if key not in os.environ:
-                    os.environ[key] = value
+# Charger les variables d'environnement depuis .env ou config.env.example
+def load_env_file(filepath):
+    """Charger les variables d'environnement depuis un fichier"""
+    if os.path.exists(filepath):
+        with open(filepath, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#') and '=' in line:
+                    key, value = line.split('=', 1)
+                    if key not in os.environ:
+                        os.environ[key] = value
+        return True
+    return False
+
+# Charger les variables d'environnement depuis config.lambda-optimized.env si .env n'existe pas
+if not load_env_file('.env'):
+    if not load_env_file('config.env.example'):
+        load_env_file('config.lambda-optimized.env')
 
 # Configuration Supabase
 SUPABASE_URL = os.getenv("SUPABASE_URL", "https://hzoggayzniyxlbwxchcx.supabase.co")
@@ -431,12 +446,15 @@ class QdrantStorage:
                     collection_name=collection_name,
                     vectors_config=VectorParams(size=384, distance=Distance.COSINE)
                 )
-                print(f"✅ Collection '{collection_name}' créée pour l'équipe {team_id}")
+                if not IS_LAMBDA:
+                    print(f"✅ Collection '{collection_name}' créée pour l'équipe {team_id}")
             else:
-                print(f"✅ Collection '{collection_name}' existe pour l'équipe {team_id}")
+                if not IS_LAMBDA:
+                    print(f"✅ Collection '{collection_name}' existe pour l'équipe {team_id}")
                 
         except Exception as e:
-            print(f"❌ Erreur collection: {e}")
+            if not IS_LAMBDA:
+                print(f"❌ Erreur collection: {e}")
             raise
     
     def store_memory(self, memory: Memory, memory_id: str, team_id: str) -> str:
@@ -470,7 +488,8 @@ class QdrantStorage:
             return memory_id
             
         except Exception as e:
-            print(f"❌ Erreur stockage: {e}")
+            if not IS_LAMBDA:
+                print(f"❌ Erreur stockage: {e}")
             raise
     
     def search_memories(self, query: str, team_id: str, limit: int = 5) -> List[Dict]:
@@ -484,7 +503,8 @@ class QdrantStorage:
             collection_names = [c.name for c in collections.collections]
             
             if collection_name not in collection_names:
-                print(f"⚠️ Collection {collection_name} n'existe pas encore")
+                if not IS_LAMBDA:
+                    print(f"⚠️ Collection {collection_name} n'existe pas encore")
                 return []
             
             query_embedding = generate_embedding(query)
@@ -511,7 +531,8 @@ class QdrantStorage:
             return results
             
         except Exception as e:
-            print(f"❌ Erreur recherche: {e}")
+            if not IS_LAMBDA:
+                print(f"❌ Erreur recherche: {e}")
             return []
     
     def delete_memory(self, memory_id: str, team_id: str) -> bool:
@@ -526,43 +547,67 @@ class QdrantStorage:
             )
             return True
         except Exception as e:
-            print(f"❌ Erreur suppression: {e}")
+            if not IS_LAMBDA:
+                print(f"❌ Erreur suppression: {e}")
             return False
     
     def list_memories(self, team_id: str) -> List[Dict]:
-        """Listage avec isolation par équipe"""
+        """Listage avec isolation par équipe et optimisations performance"""
         try:
             self._ensure_connected()
             collection_name = self._get_collection_name(team_id)
             
-            # Vérifier que la collection existe
-            collections = self.client.get_collections()
-            collection_names = [c.name for c in collections.collections]
-            
-            if collection_name not in collection_names:
+            # Vérifier que la collection existe avec timeout court
+            try:
+                collections = self.client.get_collections()
+                collection_names = [c.name for c in collections.collections]
+            except Exception as e:
+                if not IS_LAMBDA:
+                    print(f"⚠️ Erreur récupération collections: {e}")
                 return []
             
-            points = self.client.scroll(
-                collection_name=collection_name,
-                limit=1000
-            )[0]
+            if collection_name not in collection_names:
+                if not IS_LAMBDA:
+                    print(f"⚠️ Collection {collection_name} n'existe pas encore")
+                return []
+            
+            # Limiter à 20 pour Lambda (optimisation performance)
+            try:
+                points = self.client.scroll(
+                    collection_name=collection_name,
+                    limit=20,
+                    with_payload=True,
+                    with_vectors=False  # On n'a pas besoin des vecteurs pour lister
+                )[0]
+            except Exception as e:
+                if not IS_LAMBDA:
+                    print(f"⚠️ Erreur scroll Qdrant: {e}")
+                return []
             
             results = []
             for point in points:
-                results.append({
-                    "memory_id": point.id,
-                    "content": point.payload["content"],
-                    "tags": point.payload["tags"],
-                    "timestamp": point.payload["timestamp"],
-                    "user_id": point.payload.get("user_id", "unknown"),
-                    "category": point.payload.get("category", "general"),
-                    "confidence": point.payload.get("confidence", 0.5)
-                })
+                try:
+                    results.append({
+                        "memory_id": point.id,
+                        "content": point.payload.get("content", ""),
+                        "tags": point.payload.get("tags", []),
+                        "timestamp": point.payload.get("timestamp", ""),
+                        "user_id": point.payload.get("user_id", "unknown"),
+                        "category": point.payload.get("category", "general"),
+                        "confidence": point.payload.get("confidence", 0.5)
+                    })
+                except Exception as e:
+                    if not IS_LAMBDA:
+                        print(f"⚠️ Erreur traitement point {point.id}: {e}")
+                    continue
             
+            if not IS_LAMBDA:
+                print(f"✅ Récupéré {len(results)} mémoires pour l'équipe {team_id}")
             return results
             
         except Exception as e:
-            print(f"❌ Erreur listage: {e}")
+            if not IS_LAMBDA:
+                print(f"❌ Erreur listage: {e}")
             return []
 
 # Initialisation paresseuse du stockage
