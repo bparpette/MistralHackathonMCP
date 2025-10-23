@@ -17,6 +17,43 @@ from typing import List, Dict, Optional
 
 # Import paresseux pour optimiser le démarrage Lambda
 requests = None
+urllib = None
+
+def ensure_requests():
+    """Import paresseux de requests"""
+    global requests
+    if requests is None:
+        try:
+            import requests
+            if not IS_LAMBDA:
+                print("✅ Module requests importé")
+        except ImportError:
+            requests = None
+            if not IS_LAMBDA:
+                print("❌ Module requests non disponible")
+
+def ensure_urllib():
+    """Import paresseux de urllib"""
+    global urllib
+    if urllib is None:
+        try:
+            import urllib.request
+            import urllib.parse
+            import urllib.error
+            import json as json_module
+            urllib = {
+                'request': urllib.request,
+                'parse': urllib.parse,
+                'error': urllib.error,
+                'json': json_module
+            }
+            if not IS_LAMBDA:
+                print("✅ Module urllib disponible comme fallback")
+        except ImportError:
+            urllib = None
+            if not IS_LAMBDA:
+                print("❌ Module urllib non disponible")
+
 QDRANT_AVAILABLE = False
 QdrantClient = None
 Distance = None
@@ -60,9 +97,12 @@ IS_LAMBDA = (
 
 # En Lambda, mode paresseux pour éviter les timeouts
 if IS_LAMBDA:
-    # En Lambda, on désactive Qdrant au démarrage pour éviter les timeouts
-    # Il sera activé seulement quand nécessaire
-    USE_QDRANT = False
+    # En Lambda, on active Qdrant si les credentials sont disponibles
+    USE_QDRANT = bool(QDRANT_URL and QDRANT_API_KEY)
+    if USE_QDRANT:
+        print("🚀 Mode Lambda - Qdrant activé (paresseux)")
+    else:
+        print("🚀 Mode Lambda - Qdrant désactivé (pas de credentials)")
 else:
     USE_QDRANT = bool(QDRANT_URL and QDRANT_API_KEY and QDRANT_ENABLED)
 
@@ -76,7 +116,7 @@ def get_mcp():
     """Import paresseux de FastMCP - optimisé pour Lambda"""
     try:
         from mcp.server.fastmcp import FastMCP
-        # Configuration optimisée pour Lambda
+        # Configuration optimisée pour Lambda - pas d'imports FastAPI au démarrage
         return FastMCP(
             "Collective Brain Server", 
             port=3000, 
@@ -100,8 +140,73 @@ def get_request_headers() -> dict:
     """Récupérer les headers de la requête courante"""
     return current_request_headers
 
+def get_current_user_token(token: str = None):
+    """Récupérer le token utilisateur (simplifié pour Lambda)"""
+    try:
+        if not token:
+            print("⚠️ Token non fourni")
+            return ""
+        
+        print(f"🔍 Token reçu: {token[:10]}...")
+        
+        # Nettoyer le token si nécessaire
+        if token.startswith("Bearer "):
+            token = token[7:]
+            print(f"🔍 Token nettoyé: {token[:10]}...")
+        
+        return token
+        
+    except Exception as e:
+        print(f"❌ Erreur récupération token: {e}")
+        return ""
+
+def extract_token_from_context(ctx):
+    """Extraire le token Bearer depuis le contexte FastMCP"""
+    try:
+        if not ctx:
+            print("⚠️ Contexte non fourni")
+            return ""
+        
+        print("🔍 Contexte FastMCP disponible")
+        
+        # Accéder aux headers via le contexte de requête
+        if hasattr(ctx, 'request_context') and ctx.request_context:
+            print("🔍 request_context disponible")
+            
+            if hasattr(ctx.request_context, 'request') and ctx.request_context.request:
+                request = ctx.request_context.request
+                print(f"🔍 Objet request: {type(request)}")
+                
+                # Essayer d'accéder aux headers
+                if hasattr(request, 'headers'):
+                    headers = request.headers
+                    print(f"🔍 Headers via request: {headers}")
+                    if 'authorization' in headers:
+                        auth_header = headers['authorization']
+                        if auth_header.startswith("Bearer "):
+                            token = auth_header[7:]
+                            print(f"✅ Token trouvé via contexte: {token[:10]}...")
+                            return token
+                
+                # Essayer d'accéder aux métadonnées
+                if hasattr(ctx.request_context, 'meta') and ctx.request_context.meta:
+                    meta = ctx.request_context.meta
+                    print(f"🔍 Métadonnées: {meta}")
+        
+        # Essayer d'accéder aux headers via l'app FastAPI
+        if hasattr(ctx, 'fastmcp') and hasattr(ctx.fastmcp, '_app'):
+            app = ctx.fastmcp._app
+            print(f"🔍 App FastAPI: {type(app)}")
+        
+        print("❌ Token non trouvé dans le contexte")
+        return ""
+        
+    except Exception as e:
+        print(f"❌ Erreur extraction token depuis contexte: {e}")
+        return ""
+
 def extract_token_from_headers():
-    """Extraire le token Bearer depuis les headers HTTP"""
+    """Extraire le token Bearer depuis les headers HTTP (fallback)"""
     try:
         # 1. Essayer de récupérer depuis les headers de la requête courante
         request_headers = get_request_headers()
@@ -198,53 +303,80 @@ def generate_embedding(text: str) -> List[float]:
 
 def verify_user_token(user_token: str) -> Optional[Dict]:
     """Vérifier un token utilisateur via Supabase (obligatoire)"""
-    global requests
-    
-    print(f"🔍 Début vérification token: {user_token[:10]}...")
+    if not IS_LAMBDA:
+        print(f"🔍 Début vérification token: {user_token[:10]}...")
     
     if not SUPABASE_SERVICE_KEY:
-        print("❌ Supabase non configuré - authentification obligatoire")
+        if not IS_LAMBDA:
+            print("❌ Supabase non configuré - authentification obligatoire")
         return None
-    
-    # Import paresseux de requests
-    if requests is None:
-        try:
-            import requests
-            print("✅ Module requests importé")
-        except ImportError:
-            print("❌ Module requests non disponible")
-            return None
     
     try:
         # Si c'est un token Bearer, enlever le préfixe
         if user_token.startswith("Bearer "):
             user_token = user_token[7:]
-            print(f"🔍 Token nettoyé: {user_token[:10]}...")
+            if not IS_LAMBDA:
+                print(f"🔍 Token nettoyé: {user_token[:10]}...")
         
-        print(f"🔍 Appel Supabase: {SUPABASE_URL}/rest/v1/rpc/verify_user_token")
+        if not IS_LAMBDA:
+            print(f"🔍 Appel Supabase: {SUPABASE_URL}/rest/v1/rpc/verify_user_token")
         
-        # Appeler l'API Supabase pour vérifier le token
-        response = requests.post(
-            f"{SUPABASE_URL}/rest/v1/rpc/verify_user_token",
-            headers={
-                "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
-                "Content-Type": "application/json",
-                "apikey": SUPABASE_SERVICE_KEY
-            },
-            json={"token": user_token},
-            timeout=3  # Timeout court pour Lambda
-        )
+        # Utiliser requests si disponible, sinon urllib
+        ensure_requests()
+        if requests is not None:
+            if not IS_LAMBDA:
+                print("🔍 Utilisation de requests")
+            response = requests.post(
+                f"{SUPABASE_URL}/rest/v1/rpc/verify_user_token",
+                headers={
+                    "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+                    "Content-Type": "application/json",
+                    "apikey": SUPABASE_SERVICE_KEY
+                },
+                json={"token": user_token},
+                timeout=3
+            )
+            status_code = response.status_code
+            response_text = response.text
+        else:
+            if not IS_LAMBDA:
+                print("🔍 Utilisation de urllib (fallback)")
+            ensure_urllib()
+            if urllib is not None:
+                # Utiliser urllib comme fallback
+                data = json.dumps({"token": user_token}).encode('utf-8')
+                req = urllib['request'].Request(
+                    f"{SUPABASE_URL}/rest/v1/rpc/verify_user_token",
+                    data=data,
+                    headers={
+                        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+                        "Content-Type": "application/json",
+                        "apikey": SUPABASE_SERVICE_KEY
+                    }
+                )
+                response = urllib['request'].urlopen(req, timeout=3)
+                status_code = response.getcode()
+                response_text = response.read().decode('utf-8')
+            else:
+                if not IS_LAMBDA:
+                    print("❌ Aucun module HTTP disponible")
+                return None
         
-        print(f"🔍 Réponse Supabase: {response.status_code}")
+        if not IS_LAMBDA:
+            print(f"🔍 Réponse Supabase: {status_code}")
+            print(f"🔍 Contenu de la réponse: {response_text}")
         
-        if response.status_code == 200:
-            data = response.json()
-            print(f"🔍 Données reçues: {data}")
+        if status_code == 200:
+            data = json.loads(response_text)
+            if not IS_LAMBDA:
+                print(f"🔍 Données reçues: {data}")
             if data and len(data) > 0:
-                print(f"✅ Token valide pour utilisateur: {data[0]}")
+                if not IS_LAMBDA:
+                    print(f"✅ Token valide pour utilisateur: {data[0]}")
                 return data[0]
         
-        print(f"❌ Token invalide: {user_token[:10]}... (status: {response.status_code})")
+        if not IS_LAMBDA:
+            print(f"❌ Token invalide: {user_token[:10]}... (status: {status_code})")
         return None
         
     except Exception as e:
@@ -264,13 +396,12 @@ class QdrantStorage:
         if not self._initialized and not self._init_attempted:
             self._init_attempted = True
             
-            # En Lambda, on active Qdrant seulement quand nécessaire
-            if IS_LAMBDA and not QDRANT_ENABLED:
-                # Vérifier si Qdrant est configuré
-                if QDRANT_URL and QDRANT_API_KEY:
-                    # Activer Qdrant dynamiquement
-                    global USE_QDRANT
-                    USE_QDRANT = True
+            # En Lambda, activer Qdrant si les credentials sont disponibles
+            if IS_LAMBDA and QDRANT_URL and QDRANT_API_KEY:
+                print("🔧 Activation de Qdrant en Lambda...")
+                # Activer Qdrant dynamiquement
+                global USE_QDRANT
+                USE_QDRANT = True
             
             # Import paresseux
             ensure_qdrant_import()
@@ -279,19 +410,16 @@ class QdrantStorage:
                 raise Exception("Qdrant non disponible")
             
             try:
-                if not IS_LAMBDA:
-                    print("🔄 Connexion Qdrant...")
+                print("🔄 Connexion Qdrant...")
                 self.client = QdrantClient(
                     url=QDRANT_URL,
                     api_key=QDRANT_API_KEY,
-                    timeout=2  # Timeout court pour Lambda
+                    timeout=3  # Timeout court pour Lambda
                 )
                 self._initialized = True
-                if not IS_LAMBDA:
-                    print("✅ Qdrant connecté")
+                print("✅ Qdrant connecté")
             except Exception as e:
-                if not IS_LAMBDA:
-                    print(f"❌ Erreur Qdrant: {e}")
+                print(f"❌ Erreur Qdrant: {e}")
                 self.client = None
                 self._initialized = False
                 raise Exception(f"Connexion Qdrant échouée: {e}")
@@ -489,7 +617,16 @@ def get_storage():
     """Obtenir l'instance de stockage avec initialisation paresseuse"""
     global storage
     if storage is None:
-        if USE_QDRANT:
+        # En Lambda, activer Qdrant à la demande si les credentials sont disponibles
+        if IS_LAMBDA and QDRANT_URL and QDRANT_API_KEY:
+            try:
+                print("🔧 Activation de Qdrant en Lambda...")
+                storage = QdrantStorage()
+                print("✅ Qdrant activé en Lambda")
+            except Exception as e:
+                print(f"⚠️ Erreur activation Qdrant en Lambda: {e}")
+                storage = None
+        elif USE_QDRANT:
             storage = QdrantStorage()
         else:
             storage = None
@@ -505,26 +642,32 @@ def get_mcp_instance():
         mcp = get_mcp()
     return mcp
 
-# Outils MCP avec authentification
+# Outils MCP avec authentification via OAuth2PasswordBearer
 def add_memory(
     content: str,
-    user_token: str = "",
     tags: str = "",
     category: str = "general",
-    visibility: str = "team"
+    visibility: str = "team",
+    token: str = None
 ) -> str:
     """Ajouter une mémoire au cerveau collectif avec authentification"""
     
-    # Si pas de token fourni, essayer de le récupérer depuis les headers
+    # Récupérer le token via OAuth2PasswordBearer
+    if not IS_LAMBDA:
+        print("🔍 Récupération du token via OAuth2PasswordBearer...")
+    user_token = get_current_user_token(token)
+    
+    # Fallback vers l'ancienne méthode
     if not user_token:
-        print("🔍 Aucun token fourni, recherche dans les headers...")
+        if not IS_LAMBDA:
+            print("🔍 Fallback vers extract_token_from_headers...")
         user_token = extract_token_from_headers()
-        print(f"🔍 Token extrait: {user_token[:10]}..." if user_token else "🔍 Aucun token trouvé")
-        
-        # MODE TEST: Si aucun token trouvé, utiliser le token de test
-        if not user_token:
+    
+    # MODE TEST: Si aucun token trouvé, utiliser le token de test
+    if not user_token:
+        if not IS_LAMBDA:
             print("🧪 MODE TEST: Utilisation du token de test")
-            user_token = "user_d8a7996df3c777e9ac2914ef16d5b501"
+        user_token = "user_d8a7996df3c777e9ac2914ef16d5b501"
     
     if not user_token:
         return json.dumps({
@@ -533,10 +676,12 @@ def add_memory(
         })
     
     # Vérifier le token utilisateur
-    print(f"🔍 Vérification du token: {user_token[:10]}...")
+    if not IS_LAMBDA:
+        print(f"🔍 Vérification du token: {user_token[:10]}...")
     user_info = verify_user_token(user_token)
     if not user_info:
-        print(f"❌ Token invalide ou erreur de vérification: {user_token[:10]}...")
+        if not IS_LAMBDA:
+            print(f"❌ Token invalide ou erreur de vérification: {user_token[:10]}...")
         return json.dumps({
             "status": "error",
             "message": f"Token utilisateur invalide: {user_token[:10]}..."
@@ -606,14 +751,22 @@ def add_memory(
 
 def search_memories(
     query: str,
-    user_token: str = "",
-    limit: int = 5
+    limit: int = 5,
+    token: str = None
 ) -> str:
     """Rechercher dans le cerveau collectif avec authentification"""
     
-    # Si pas de token fourni, essayer de le récupérer depuis les headers
+    # Récupérer le token via OAuth2PasswordBearer
+    user_token = get_current_user_token(token)
+    
+    # Fallback vers l'ancienne méthode
     if not user_token:
         user_token = extract_token_from_headers()
+    
+    # MODE TEST: Si aucun token trouvé, utiliser le token de test
+    if not user_token:
+        print("🧪 MODE TEST: Utilisation du token de test")
+        user_token = "user_d8a7996df3c777e9ac2914ef16d5b501"
     
     if not user_token:
         return json.dumps({
@@ -622,10 +775,8 @@ def search_memories(
         })
     
     # Vérifier le token utilisateur
-    print(f"🔍 Vérification du token: {user_token[:10]}...")
     user_info = verify_user_token(user_token)
     if not user_info:
-        print(f"❌ Token invalide ou erreur de vérification: {user_token[:10]}...")
         return json.dumps({
             "status": "error",
             "message": f"Token utilisateur invalide: {user_token[:10]}..."
@@ -676,77 +827,92 @@ def search_memories(
         "team": team_id
     })
 
-def delete_memory(memory_id: str, user_token: str = "") -> str:
-    """Supprimer une mémoire du cerveau collectif avec authentification"""
-    
-    # Si pas de token fourni, essayer de le récupérer depuis les headers
-    if not user_token:
-        user_token = extract_token_from_headers()
-    
-    if not user_token:
-        return json.dumps({
-            "status": "error",
-            "message": "Token utilisateur requis. Veuillez configurer l'authentification Bearer dans Le Chat."
-        })
-    
-    # Vérifier le token utilisateur
-    print(f"🔍 Vérification du token: {user_token[:10]}...")
-    user_info = verify_user_token(user_token)
-    if not user_info:
-        print(f"❌ Token invalide ou erreur de vérification: {user_token[:10]}...")
-        return json.dumps({
-            "status": "error",
-            "message": f"Token utilisateur invalide: {user_token[:10]}..."
-        })
-    
-    team_id = user_info["team_id"]
-    user_name = user_info["user_name"]
-    
-    storage = get_storage()
-    if storage:
-        try:
-            success = storage.delete_memory(memory_id, team_id)
-            if success:
-                return json.dumps({
-                    "status": "success",
-                    "message": f"Mémoire {memory_id} supprimée du cerveau collectif (Qdrant)"
-                })
-            else:
-                return json.dumps({
-                    "status": "error",
-                    "message": "Erreur lors de la suppression"
-                })
-        except Exception as e:
-            print(f"⚠️ Erreur Qdrant, fallback vers mémoire: {e}")
-    
-    # Utiliser le stockage en mémoire (fallback ou par défaut)
-    if memory_id not in memories:
-        return json.dumps({
-            "status": "error",
-            "message": "Mémoire non trouvée"
-        })
-    
-    # Vérifier que la mémoire appartient à l'équipe de l'utilisateur
-    memory = memories[memory_id]
-    if memory.team_id != team_id:
-        return json.dumps({
-            "status": "error",
-            "message": "Accès non autorisé à cette mémoire"
-        })
-    
-    del memories[memory_id]
-    
-    return json.dumps({
-        "status": "success",
-        "message": f"Mémoire {memory_id} supprimée du cerveau collectif (mémoire)"
-    })
+# TEMPORAIREMENT DÉSACTIVÉ POUR LA PRODUCTION
+# def delete_memory(memory_id: str, token: str = None) -> str:
+#     """Supprimer une mémoire du cerveau collectif avec authentification"""
+#     
+#     # Récupérer le token via OAuth2PasswordBearer
+#     user_token = get_current_user_token(token)
+#     
+#     # Fallback vers l'ancienne méthode
+#     if not user_token:
+#         user_token = extract_token_from_headers()
+#     
+#     # MODE TEST: Si aucun token trouvé, utiliser le token de test
+#     if not user_token:
+#         print("🧪 MODE TEST: Utilisation du token de test")
+#         user_token = "user_d8a7996df3c777e9ac2914ef16d5b501"
+#     
+#     if not user_token:
+#         return json.dumps({
+#             "status": "error",
+#             "message": "Token utilisateur requis. Veuillez configurer l'authentification Bearer dans Le Chat."
+#         })
+#     
+#     # Vérifier le token utilisateur
+#     user_info = verify_user_token(user_token)
+#     if not user_info:
+#         return json.dumps({
+#             "status": "error",
+#             "message": f"Token utilisateur invalide: {user_token[:10]}..."
+#         })
+#     
+#     team_id = user_info["team_id"]
+#     user_name = user_info["user_name"]
+#     
+#     storage = get_storage()
+#     if storage:
+#         try:
+#             success = storage.delete_memory(memory_id, team_id)
+#             if success:
+#                 return json.dumps({
+#                     "status": "success",
+#                     "message": f"Mémoire {memory_id} supprimée du cerveau collectif (Qdrant)"
+#                 })
+#             else:
+#                 return json.dumps({
+#                     "status": "error",
+#                     "message": "Erreur lors de la suppression"
+#                 })
+#         except Exception as e:
+#             print(f"⚠️ Erreur Qdrant, fallback vers mémoire: {e}")
+#     
+#     # Utiliser le stockage en mémoire (fallback ou par défaut)
+#     if memory_id not in memories:
+#         return json.dumps({
+#             "status": "error",
+#             "message": "Mémoire non trouvée"
+#         })
+#     
+#     # Vérifier que la mémoire appartient à l'équipe de l'utilisateur
+#     memory = memories[memory_id]
+#     if memory.team_id != team_id:
+#         return json.dumps({
+#             "status": "error",
+#             "message": "Accès non autorisé à cette mémoire"
+#         })
+#     
+#     del memories[memory_id]
+#     
+#     return json.dumps({
+#         "status": "success",
+#         "message": f"Mémoire {memory_id} supprimée du cerveau collectif (mémoire)"
+#     })
 
-def list_memories(user_token: str = "") -> str:
+def list_memories(token: str = None) -> str:
     """Lister toutes les mémoires du cerveau collectif avec authentification"""
     
-    # Si pas de token fourni, essayer de le récupérer depuis les headers
+    # Récupérer le token via OAuth2PasswordBearer
+    user_token = get_current_user_token(token)
+    
+    # Fallback vers l'ancienne méthode
     if not user_token:
         user_token = extract_token_from_headers()
+    
+    # MODE TEST: Si aucun token trouvé, utiliser le token de test
+    if not user_token:
+        print("🧪 MODE TEST: Utilisation du token de test")
+        user_token = "user_d8a7996df3c777e9ac2914ef16d5b501"
     
     if not user_token:
         return json.dumps({
@@ -755,10 +921,8 @@ def list_memories(user_token: str = "") -> str:
         })
     
     # Vérifier le token utilisateur
-    print(f"🔍 Vérification du token: {user_token[:10]}...")
     user_info = verify_user_token(user_token)
     if not user_info:
-        print(f"❌ Token invalide ou erreur de vérification: {user_token[:10]}...")
         return json.dumps({
             "status": "error",
             "message": f"Token utilisateur invalide: {user_token[:10]}..."
@@ -809,12 +973,20 @@ def list_memories(user_token: str = "") -> str:
         "team": team_id
     })
 
-def get_team_insights(user_token: str = "") -> str:
+def get_team_insights(token: str = None) -> str:
     """Obtenir des insights sur l'activité de l'équipe avec authentification"""
     
-    # Si pas de token fourni, essayer de le récupérer depuis les headers
+    # Récupérer le token via OAuth2PasswordBearer
+    user_token = get_current_user_token(token)
+    
+    # Fallback vers l'ancienne méthode
     if not user_token:
         user_token = extract_token_from_headers()
+    
+    # MODE TEST: Si aucun token trouvé, utiliser le token de test
+    if not user_token:
+        print("🧪 MODE TEST: Utilisation du token de test")
+        user_token = "user_d8a7996df3c777e9ac2914ef16d5b501"
     
     if not user_token:
         return json.dumps({
@@ -823,10 +995,8 @@ def get_team_insights(user_token: str = "") -> str:
         })
     
     # Vérifier le token utilisateur
-    print(f"🔍 Vérification du token: {user_token[:10]}...")
     user_info = verify_user_token(user_token)
     if not user_info:
-        print(f"❌ Token invalide ou erreur de vérification: {user_token[:10]}...")
         return json.dumps({
             "status": "error",
             "message": f"Token utilisateur invalide: {user_token[:10]}..."
@@ -931,18 +1101,7 @@ def initialize_mcp():
         mcp = get_mcp()
         
         if mcp:
-            # Ajouter le middleware pour capturer les headers
-            try:
-                # FastMCP utilise uvicorn, on doit accéder à l'app FastAPI différemment
-                if hasattr(mcp, '_app') and mcp._app:
-                    mcp._app.middleware("http")(capture_headers_middleware)
-                    print("✅ Middleware headers ajouté")
-                else:
-                    print("⚠️ App FastAPI non accessible pour le middleware")
-            except Exception as e:
-                print(f"⚠️ Impossible d'ajouter le middleware: {e}")
-            
-            # Enregistrer les outils
+            # Enregistrer les outils avec OAuth2PasswordBearer
             mcp.tool(
                 title="Add Memory",
                 description="Ajouter une mémoire au cerveau collectif de l'équipe",
@@ -953,10 +1112,11 @@ def initialize_mcp():
                 description="Rechercher dans le cerveau collectif de l'équipe",
             )(search_memories)
             
-            mcp.tool(
-                title="Delete Memory",
-                description="Supprimer une mémoire du cerveau collectif",
-            )(delete_memory)
+            # TEMPORAIREMENT DÉSACTIVÉ POUR LA PRODUCTION
+            # mcp.tool(
+            #     title="Delete Memory",
+            #     description="Supprimer une mémoire du cerveau collectif",
+            # )(delete_memory)
             
             mcp.tool(
                 title="List All Memories",

@@ -1,7 +1,10 @@
 {
   "mcpServers": {
     "mistral-hackathon-mcp": {
-      "url": "https://mistralhackathonmcp-ee61017d.alpic.live/"
+      "url": "https://mistralhackathonmcp-ee61017d.alpic.live/",
+      "headers": {
+        "Authorization": "Bearer user_d8a7996df3c777e9ac2914ef16d5b501"
+      }
     }
   }
 }
